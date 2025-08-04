@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"golang.org/x/crypto/bcrypt"
+	"gopkg.in/yaml.v3"
 )
 
 var buildVersion = "dev"
@@ -28,7 +29,7 @@ func Main() int {
 			return 1
 		}
 
-		if err := serveApp(options.configPath); err != nil {
+		if err := serveApp(options.configPath, options.configURL); err != nil {
 			fmt.Println(err)
 			return 1
 		}
@@ -90,13 +91,29 @@ func Main() int {
 	return 0
 }
 
-func serveApp(configPath string) error {
+func serveApp(configPath, configURL string) error {
 	// TODO: refactor if this gets any more complex, the current implementation is
 	// difficult to reason about due to all of the callbacks and simultaneous operations,
 	// use a single goroutine and a channel to initiate synchronous changes to the server
 	exitChannel := make(chan struct{})
 	hadValidConfigOnStartup := false
 	var stopServer func() error
+
+	// Determine which config URL to use (CLI parameter takes precedence)
+	effectiveConfigURL := configURL
+	if effectiveConfigURL == "" {
+		// Check if there's a config-url specified in the local config file
+		localConfigContents, _, err := parseYAMLIncludes(configPath)
+		if err != nil {
+			return fmt.Errorf("parsing config: %w", err)
+		}
+
+		localConfig := &config{}
+		localConfig.Server.Port = 8080
+		if err := yaml.Unmarshal(localConfigContents, localConfig); err == nil && localConfig.ConfigURL != "" {
+			effectiveConfigURL = localConfig.ConfigURL
+		}
+	}
 
 	onChange := func(newContents []byte) {
 		if stopServer != nil {
@@ -125,6 +142,9 @@ func serveApp(configPath string) error {
 			return
 		}
 
+		// Set the config URL and path for dynamic reloading
+		app.setConfigURLAndPath(effectiveConfigURL, configPath)
+
 		if !hadValidConfigOnStartup {
 			hadValidConfigOnStartup = true
 		}
@@ -149,9 +169,24 @@ func serveApp(configPath string) error {
 		log.Printf("Error watching config files: %v", err)
 	}
 
-	configContents, configIncludes, err := parseYAMLIncludes(configPath)
-	if err != nil {
-		return fmt.Errorf("parsing config: %w", err)
+	var configContents []byte
+	var configIncludes map[string]struct{}
+
+	if effectiveConfigURL != "" {
+		log.Printf("Config URL specified: %s", effectiveConfigURL)
+		// Use the URL-based config fetching
+		var err error
+		configContents, configIncludes, err = fetchConfigFromURL(effectiveConfigURL, configPath)
+		if err != nil {
+			return fmt.Errorf("fetching config from URL: %w", err)
+		}
+	} else {
+		// Use local file
+		var err error
+		configContents, configIncludes, err = parseYAMLIncludes(configPath)
+		if err != nil {
+			return fmt.Errorf("parsing config: %w", err)
+		}
 	}
 
 	stopWatching, err := configFilesWatcher(configPath, configContents, configIncludes, onChange, onErr)
@@ -169,6 +204,9 @@ func serveApp(configPath string) error {
 		if err != nil {
 			return fmt.Errorf("creating application: %w", err)
 		}
+
+		// Set the config URL and path for dynamic reloading
+		app.setConfigURLAndPath(effectiveConfigURL, configPath)
 
 		startServer, _ := app.server()
 		if err := startServer(); err != nil {

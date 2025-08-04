@@ -42,6 +42,11 @@ type application struct {
 	usernameHashToUsername map[string]string
 	authAttemptsMu         sync.Mutex
 	failedAuthAttempts     map[string]*failedAuthAttempt
+
+	// For config URL reloading
+	configURL    string
+	configPath   string
+	configMutex  sync.RWMutex
 }
 
 func newApplication(c *config) (*application, error) {
@@ -304,6 +309,12 @@ func (a *application) populateTemplateRequestData(data *templateRequestData, r *
 }
 
 func (a *application) handlePageRequest(w http.ResponseWriter, r *http.Request) {
+	// Check if we need to reload config from URL
+	if err := a.reloadConfigFromURLIfNeeded(); err != nil {
+		log.Printf("Failed to reload config from URL: %v", err)
+		// Continue with existing config on error
+	}
+
 	page, exists := a.slugToPage[r.PathValue("page")]
 	if !exists {
 		a.handleNotFound(w, r)
@@ -332,6 +343,12 @@ func (a *application) handlePageRequest(w http.ResponseWriter, r *http.Request) 
 }
 
 func (a *application) handlePageContentRequest(w http.ResponseWriter, r *http.Request) {
+	// Check if we need to reload config from URL
+	if err := a.reloadConfigFromURLIfNeeded(); err != nil {
+		log.Printf("Failed to reload config from URL: %v", err)
+		// Continue with existing config on error
+	}
+
 	page, exists := a.slugToPage[r.PathValue("page")]
 	if !exists {
 		a.handleNotFound(w, r)
@@ -513,4 +530,242 @@ func (a *application) server() (func() error, func() error) {
 	}
 
 	return start, stop
+}
+
+// setConfigURLAndPath sets the config URL and path for dynamic reloading
+func (a *application) setConfigURLAndPath(configURL, configPath string) {
+	a.configMutex.Lock()
+	defer a.configMutex.Unlock()
+	a.configURL = configURL
+	a.configPath = configPath
+}
+
+// reloadConfigFromURLIfNeeded fetches fresh config from URL if configURL is set
+func (a *application) reloadConfigFromURLIfNeeded() error {
+	a.configMutex.RLock()
+	configURL := a.configURL
+	configPath := a.configPath
+	a.configMutex.RUnlock()
+
+	// Only reload if we have a config URL
+	if configURL == "" {
+		return nil
+	}
+
+	// Fetch fresh config from URL
+	configContents, _, err := fetchConfigFromURL(configURL, configPath)
+	if err != nil {
+		return fmt.Errorf("fetching config from URL %s: %w", configURL, err)
+	}
+
+	// Parse the new config
+	newConfig, err := newConfigFromYAML(configContents)
+	if err != nil {
+		return fmt.Errorf("parsing config from URL: %w", err)
+	}
+
+	// Update the existing application in-place
+	if err := a.updateConfigInPlace(newConfig); err != nil {
+		return fmt.Errorf("updating application with new config: %w", err)
+	}
+
+	log.Printf("Successfully reloaded config from URL")
+	return nil
+}
+
+// updateConfigInPlace updates the existing application with new config data
+func (a *application) updateConfigInPlace(newConfig *config) error {
+	a.configMutex.Lock()
+	defer a.configMutex.Unlock()
+
+	// Store original values that should be preserved
+	originalConfigURL := a.configURL
+	originalConfigPath := a.configPath
+	originalVersion := a.Version
+	originalCreatedAt := a.CreatedAt
+
+	// Update the config
+	a.Config = *newConfig
+
+	// Reinitialize auth if needed
+	if len(newConfig.Auth.Users) > 0 {
+		secretBytes, err := base64.StdEncoding.DecodeString(newConfig.Auth.SecretKey)
+		if err != nil {
+			return fmt.Errorf("decoding secret-key: %v", err)
+		}
+
+		if len(secretBytes) != AUTH_SECRET_KEY_LENGTH {
+			return fmt.Errorf("secret-key must be exactly %d bytes", AUTH_SECRET_KEY_LENGTH)
+		}
+
+		a.usernameHashToUsername = make(map[string]string)
+		if a.failedAuthAttempts == nil {
+			a.failedAuthAttempts = make(map[string]*failedAuthAttempt)
+		}
+		a.RequiresAuth = true
+
+		for username := range newConfig.Auth.Users {
+			user := newConfig.Auth.Users[username]
+			usernameHash, err := computeUsernameHash(username, secretBytes)
+			if err != nil {
+				return fmt.Errorf("computing username hash for user %s: %v", username, err)
+			}
+			a.usernameHashToUsername[string(usernameHash)] = username
+
+			if user.PasswordHashString != "" {
+				user.PasswordHash = []byte(user.PasswordHashString)
+				user.PasswordHashString = ""
+			} else {
+				hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
+				if err != nil {
+					return fmt.Errorf("hashing password for user %s: %v", username, err)
+				}
+
+				user.Password = ""
+				user.PasswordHash = hashedPassword
+			}
+		}
+
+		a.authSecretKey = secretBytes
+	} else {
+		a.RequiresAuth = false
+		a.authSecretKey = nil
+		a.usernameHashToUsername = nil
+	}
+
+	// Reinitialize themes
+	if !newConfig.Theme.DisablePicker {
+		themeKeys := make([]string, 0, 2)
+		themeProps := make([]*themeProperties, 0, 2)
+
+		defaultDarkTheme, ok := newConfig.Theme.Presets.Get("default-dark")
+		if ok && !newConfig.Theme.SameAs(defaultDarkTheme) || !newConfig.Theme.SameAs(&themeProperties{}) {
+			themeKeys = append(themeKeys, "default-dark")
+			themeProps = append(themeProps, &themeProperties{})
+		}
+
+		themeKeys = append(themeKeys, "default-light")
+		themeProps = append(themeProps, &themeProperties{
+			Light:                    true,
+			BackgroundColor:          &hslColorField{240, 13, 95},
+			PrimaryColor:             &hslColorField{230, 100, 30},
+			NegativeColor:            &hslColorField{0, 70, 50},
+			ContrastMultiplier:       1.3,
+			TextSaturationMultiplier: 0.5,
+		})
+
+		themePresets, err := newOrderedYAMLMap(themeKeys, themeProps)
+		if err != nil {
+			return fmt.Errorf("creating theme presets: %v", err)
+		}
+		a.Config.Theme.Presets = *themePresets.Merge(&a.Config.Theme.Presets)
+
+		for key, properties := range a.Config.Theme.Presets.Items() {
+			properties.Key = key
+			if err := properties.init(); err != nil {
+				return fmt.Errorf("initializing preset theme %s: %v", key, err)
+			}
+		}
+	}
+
+	a.Config.Theme.Key = "default"
+	if err := a.Config.Theme.init(); err != nil {
+		return fmt.Errorf("initializing default theme: %v", err)
+	}
+
+	// Reinitialize pages and widgets
+	a.slugToPage = make(map[string]*page)
+	a.widgetByID = make(map[uint64]widget)
+	a.slugToPage[""] = &a.Config.Pages[0]
+
+	providers := &widgetProviders{
+		assetResolver: a.StaticAssetPath,
+	}
+
+	for p := range a.Config.Pages {
+		page := &a.Config.Pages[p]
+		page.PrimaryColumnIndex = -1
+
+		if page.Slug == "" {
+			page.Slug = titleToSlug(page.Title)
+		}
+
+		if slices.Contains(reservedPageSlugs, page.Slug) {
+			return fmt.Errorf("page slug \"%s\" is reserved", page.Slug)
+		}
+
+		a.slugToPage[page.Slug] = page
+
+		if page.Width == "default" {
+			page.Width = ""
+		}
+
+		if page.DesktopNavigationWidth == "" && page.DesktopNavigationWidth != "default" {
+			page.DesktopNavigationWidth = page.Width
+		}
+
+		for i := range page.HeadWidgets {
+			widget := page.HeadWidgets[i]
+			a.widgetByID[widget.GetID()] = widget
+			widget.setProviders(providers)
+		}
+
+		for c := range page.Columns {
+			column := &page.Columns[c]
+
+			if page.PrimaryColumnIndex == -1 && column.Size == "full" {
+				page.PrimaryColumnIndex = int8(c)
+			}
+
+			for w := range column.Widgets {
+				widget := column.Widgets[w]
+				a.widgetByID[widget.GetID()] = widget
+				widget.setProviders(providers)
+			}
+		}
+	}
+
+	// Update asset paths and branding
+	a.Config.Server.BaseURL = strings.TrimRight(a.Config.Server.BaseURL, "/")
+	a.Config.Theme.CustomCSSFile = a.resolveUserDefinedAssetPath(a.Config.Theme.CustomCSSFile)
+	a.Config.Branding.LogoURL = a.resolveUserDefinedAssetPath(a.Config.Branding.LogoURL)
+
+	a.Config.Branding.FaviconURL = ternary(
+		a.Config.Branding.FaviconURL == "",
+		a.StaticAssetPath("favicon.svg"),
+		a.resolveUserDefinedAssetPath(a.Config.Branding.FaviconURL),
+	)
+
+	a.Config.Branding.FaviconType = ternary(
+		strings.HasSuffix(a.Config.Branding.FaviconURL, ".svg"),
+		"image/svg+xml",
+		"image/png",
+	)
+
+	if a.Config.Branding.AppName == "" {
+		a.Config.Branding.AppName = "Glance"
+	}
+
+	if a.Config.Branding.AppIconURL == "" {
+		a.Config.Branding.AppIconURL = a.StaticAssetPath("app-icon.png")
+	}
+
+	if a.Config.Branding.AppBackgroundColor == "" {
+		a.Config.Branding.AppBackgroundColor = a.Config.Theme.BackgroundColorAsHex
+	}
+
+	// Update manifest
+	manifest, err := executeTemplateToString(manifestTemplate, templateData{App: a})
+	if err != nil {
+		return fmt.Errorf("parsing manifest.json: %v", err)
+	}
+	a.parsedManifest = []byte(manifest)
+
+	// Restore preserved values
+	a.configURL = originalConfigURL
+	a.configPath = originalConfigPath
+	a.Version = originalVersion
+	a.CreatedAt = originalCreatedAt
+
+	return nil
 }

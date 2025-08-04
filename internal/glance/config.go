@@ -5,12 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"iter"
 	"log"
 	"maps"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +39,8 @@ type config struct {
 		AssetsPath string `yaml:"assets-path"`
 		BaseURL    string `yaml:"base-url"`
 	} `yaml:"server"`
+
+	ConfigURL string `yaml:"config-url"`
 
 	Auth struct {
 		SecretKey string           `yaml:"secret-key"`
@@ -534,6 +540,78 @@ func isConfigStateValid(config *config) error {
 	}
 
 	return nil
+}
+
+// addCacheBustingParams adds cache-busting parameters to a URL to ensure fresh content
+func addCacheBustingParams(originalURL string) (string, error) {
+	parsedURL, err := url.Parse(originalURL)
+	if err != nil {
+		return "", fmt.Errorf("parsing URL: %v", err)
+	}
+
+	// Get current query parameters
+	query := parsedURL.Query()
+
+	// Add timestamp-based cache busting parameter
+	// timestamp := strconv.FormatInt(time.Now().UnixNano(), 10)
+	// query.Set("_t", timestamp)
+
+	// Add a random component for additional cache busting
+	query.Set("test", strconv.FormatInt(time.Now().UnixMilli()%10000, 10))
+
+	// Update the URL with new query parameters
+	parsedURL.RawQuery = query.Encode()
+
+	return parsedURL.String(), nil
+}
+
+// fetchConfigFromURL attempts to fetch configuration from a URL with fallback to local file
+func fetchConfigFromURL(configURL, configPath string) ([]byte, map[string]struct{}, error) {
+	// If no URL is specified, use the local file
+	if configURL == "" {
+		return parseYAMLIncludes(configPath)
+	}
+
+	// Add cache-busting parameters to the URL
+	cacheBustURL, err := addCacheBustingParams(configURL)
+	if err != nil {
+		log.Printf("Failed to add cache-busting params to URL %s: %v", configURL, err)
+		cacheBustURL = configURL // fallback to original URL
+	}
+
+	// Try to fetch from URL first
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+	resp, err := client.Get(cacheBustURL)
+	if err != nil {
+		log.Printf("Failed to fetch config from URL %s: %v", cacheBustURL, err)
+		log.Printf("Falling back to local config file %s", configPath)
+		// Fall back to local file
+		return parseYAMLIncludes(configPath)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("Failed to fetch config from URL %s: status code %d", cacheBustURL, resp.StatusCode)
+		log.Printf("Falling back to local config file %s", configPath)
+		// Fall back to local file
+		return parseYAMLIncludes(configPath)
+	}
+
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Failed to read config from URL %s: %v", cacheBustURL, err)
+		log.Printf("Falling back to local config file %s", configPath)
+		// Fall back to local file
+		return parseYAMLIncludes(configPath)
+	}
+	log.Printf("Successfully fetched config from URL %s", cacheBustURL)
+
+	// For URL-based configs, we don't support includes in the same way,
+	// so we return an empty includes map
+	return body, make(map[string]struct{}), nil
 }
 
 // Read-only way to store ordered maps from a YAML structure

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"log"
 	"strings"
 
 	"github.com/shirou/gopsutil/v4/disk"
@@ -27,6 +28,7 @@ const (
 type cliOptions struct {
 	intent     cliIntent
 	configPath string
+	configURL  string
 	args       []string
 }
 
@@ -58,6 +60,9 @@ func parseCliOptions() (*cliOptions, error) {
 	}
 
 	configPath := flags.String("config", "glance.yml", "Set config path")
+	configURL := flags.String("config-url", "", "Set config URL (overrides config file)")
+	log.Printf("Config path: %s", *configPath)
+	log.Printf("Config URL: %s", *configURL)
 	err := flags.Parse(os.Args[1:])
 	if err != nil {
 		return nil, err
@@ -102,6 +107,7 @@ func parseCliOptions() (*cliOptions, error) {
 	return &cliOptions{
 		intent:     intent,
 		configPath: *configPath,
+		configURL:  *configURL,
 		args:       args,
 	}, nil
 }
