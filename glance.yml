@@ -1,0 +1,90 @@
+# Sample Glance Configuration with URL Support
+# This file demonstrates the new config-url feature
+
+# Option 1: Fetch configuration from a URL (like a GitHub Gist)
+# Uncomment the line below to use a remote configuration
+config-url: "https://gist.githubusercontent.com/VigneshVaidyanathan/fd075f0e43f9df4b81df60f99e651138/raw/glance.yml"
+
+# Option 2: Use CLI parameter to override (highest priority)
+# ./glance --config-url "https://gist.githubusercontent.com/username/gist-id/raw/glance.yml"
+
+# Local fallback configuration (used if URL fetch fails or no URL specified)
+server:
+  host: 0.0.0.0
+  port: 8080
+  # base-url: "" # Set if behind reverse proxy
+
+pages:
+  - name: Home
+    columns:
+      - size: small
+        widgets:
+          - type: calendar
+            first-day-of-week: monday
+
+          - type: clock
+            title: Current Time
+            hour-format: 24h
+            timezones:
+              - timezone: America/New_York
+                label: New York
+              - timezone: Europe/London
+                label: London
+              - timezone: Asia/Tokyo
+                label: Tokyo
+
+      - size: full
+        widgets:
+          - type: rss
+            title: Tech News
+            limit: 10
+            collapse-after: 5
+            cache: 1h
+            feeds:
+              - url: https://feeds.feedburner.com/oreilly/radar
+                title: O'Reilly Radar
+              - url: https://www.theverge.com/rss/index.xml
+                title: The Verge
+              - url: https://techcrunch.com/feed/
+                title: TechCrunch
+
+          - type: hacker-news
+            limit: 15
+            collapse-after: 8
+
+      - size: small
+        widgets:
+          - type: weather
+            location: San Francisco, CA
+            units: metric
+            hour-format: 24h
+
+          - type: bookmarks
+            groups:
+              - title: Development
+                color: 10 70 50
+                links:
+                  - title: GitHub
+                    url: https://github.com
+                  - title: Stack Overflow
+                    url: https://stackoverflow.com
+                  - title: MDN Web Docs
+                    url: https://developer.mozilla.org
+
+              - title: Tools
+                color: 200 70 50
+                links:
+                  - title: Glance Repository
+                    url: https://github.com/glanceapp/glance
+                  - title: Docker Hub
+                    url: https://hub.docker.com
+
+# Example of how to use the config-url feature:
+# 
+# 1. Create a GitHub Gist with your glance.yml configuration
+# 2. Get the raw URL of the gist
+# 3. Either:
+#    a) Add "config-url: <your-gist-url>" to this file, or
+#    b) Run: ./glance --config-url "<your-gist-url>"
+# 
+# If the URL fetch fails, this local configuration will be used as fallback.
